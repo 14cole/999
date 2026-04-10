@@ -1469,12 +1469,24 @@ class RcsGrid:
             "phi(deg)": "phi_deg",
             "phi": "phi_deg",
             "rcstheta-theta(dbsm)": "rcs_vv_dbsm",
+            "rcstheta-thetadbsm": "rcs_vv_dbsm",
+            "rcstheta-theta(dbm^2)": "rcs_vv_dbsm",
+            "rcstheta-thetadbm2": "rcs_vv_dbsm",
             "rcstheta-theta": "rcs_vv_dbsm",
             "rcsphi-theta(dbsm)": "rcs_hv_dbsm",
+            "rcsphi-thetadbsm": "rcs_hv_dbsm",
+            "rcsphi-theta(dbm^2)": "rcs_hv_dbsm",
+            "rcsphi-thetadbm2": "rcs_hv_dbsm",
             "rcsphi-theta": "rcs_hv_dbsm",
             "rcstheta-phi(dbsm)": "rcs_vh_dbsm",
+            "rcstheta-phidbsm": "rcs_vh_dbsm",
+            "rcstheta-phi(dbm^2)": "rcs_vh_dbsm",
+            "rcstheta-phidbm2": "rcs_vh_dbsm",
             "rcstheta-phi": "rcs_vh_dbsm",
             "rcsphi-phi(dbsm)": "rcs_hh_dbsm",
+            "rcsphi-phidbsm": "rcs_hh_dbsm",
+            "rcsphi-phi(dbm^2)": "rcs_hh_dbsm",
+            "rcsphi-phidbm2": "rcs_hh_dbsm",
             "rcsphi-phi": "rcs_hh_dbsm",
             "phasetheta-theta(deg)": "phase_vv_deg",
             "phasetheta-theta(dbsm)": "phase_vv_deg",
@@ -1495,30 +1507,121 @@ class RcsGrid:
         if not rows:
             raise ValueError("CSV is empty")
 
+        def _classify_fuzzy_header(cell_value: str) -> str | None:
+            raw = str(cell_value or "").strip().lower()
+            if raw == "":
+                return None
+
+            key = alias_to_key.get(_norm(raw))
+            if key is not None:
+                return key
+
+            compact = re.sub(r"[^a-z0-9]+", "", raw)
+            if compact in {"f", "freq"} or "frequency" in compact:
+                return "frequency"
+            if (
+                "theta" in compact
+                and "phase" not in compact
+                and "rcs" not in compact
+                and "abs" not in compact
+            ):
+                return "theta_deg"
+            if (
+                "phi" in compact
+                and "phase" not in compact
+                and "rcs" not in compact
+                and "abs" not in compact
+            ):
+                return "phi_deg"
+
+            has_phase = "phase" in compact
+            has_mag = (("rcs" in compact) or ("abs" in compact) or ("sigma" in compact)) and not has_phase
+            if not has_phase and not has_mag:
+                return None
+
+            pair_key: str | None = None
+            theta_count = len(re.findall("theta", raw))
+            phi_count = len(re.findall("phi", raw))
+            if "phi-theta" in raw or re.search(r"phi[^a-z0-9]+theta", raw):
+                pair_key = "hv"
+            elif "theta-phi" in raw or re.search(r"theta[^a-z0-9]+phi", raw):
+                pair_key = "vh"
+            elif theta_count >= 2:
+                pair_key = "vv"
+            elif phi_count >= 2:
+                pair_key = "hh"
+            elif theta_count == 1 and phi_count == 0:
+                pair_key = "vv"
+            elif phi_count == 1 and theta_count == 0:
+                pair_key = "hh"
+            elif theta_count == 1 and phi_count == 1:
+                pair_key = "hv" if raw.find("phi") < raw.find("theta") else "vh"
+
+            if pair_key is None:
+                return None
+            if has_phase:
+                return f"phase_{pair_key}_deg"
+            return f"rcs_{pair_key}_dbsm"
+
+        def _is_numeric_axes_row(row_values: list[str]) -> bool:
+            if len(row_values) < 3:
+                return False
+            try:
+                f_val = float(str(row_values[0]).strip())
+                t_val = float(str(row_values[1]).strip())
+                p_val = float(str(row_values[2]).strip())
+            except ValueError:
+                return False
+            return bool(np.isfinite(f_val) and np.isfinite(t_val) and np.isfinite(p_val))
+
         header_idx = None
+        data_start_idx = 0
         col_idx: dict[str, int] = {}
         header_tokens: dict[str, str] = {}
         required_axes = {"frequency", "theta_deg", "phi_deg"}
-        required_rcs = {"rcs_vv_dbsm", "rcs_hv_dbsm", "rcs_vh_dbsm", "rcs_hh_dbsm"}
         for i, row in enumerate(rows):
             mapped: dict[str, int] = {}
             mapped_tokens: dict[str, str] = {}
             for j, cell in enumerate(row):
-                normalized = _norm(cell)
-                key = alias_to_key.get(normalized)
+                key = _classify_fuzzy_header(cell)
                 if key is not None and key not in mapped:
                     mapped[key] = j
-                    mapped_tokens[key] = normalized
-            if required_axes.issubset(mapped.keys()) and required_rcs.issubset(mapped.keys()):
+                    mapped_tokens[key] = str(cell)
+            has_any_rcs = any(k.startswith("rcs_") for k in mapped.keys())
+            if required_axes.issubset(mapped.keys()) and has_any_rcs:
                 header_idx = i
+                data_start_idx = i + 1
                 col_idx = mapped
                 header_tokens = mapped_tokens
                 break
 
         if header_idx is None:
+            for i, row in enumerate(rows):
+                if _is_numeric_axes_row(row):
+                    header_idx = i - 1
+                    data_start_idx = i
+                    col_idx = {"frequency": 0, "theta_deg": 1, "phi_deg": 2}
+                    if len(row) > 3:
+                        col_idx["rcs_vv_dbsm"] = 3
+                    if len(row) > 4:
+                        col_idx["rcs_hv_dbsm"] = 4
+                    if len(row) > 5:
+                        col_idx["rcs_vh_dbsm"] = 5
+                    if len(row) > 6:
+                        col_idx["rcs_hh_dbsm"] = 6
+                    if len(row) > 7:
+                        col_idx["phase_vv_deg"] = 7
+                    if len(row) > 8:
+                        col_idx["phase_hv_deg"] = 8
+                    if len(row) > 9:
+                        col_idx["phase_vh_deg"] = 9
+                    if len(row) > 10:
+                        col_idx["phase_hh_deg"] = 10
+                    break
+
+        if "frequency" not in col_idx or "theta_deg" not in col_idx or "phi_deg" not in col_idx:
             raise ValueError(
-                "Could not find required CSV header row. "
-                "Need frequency/theta/phi plus rcs theta-theta/phi-theta/theta-phi/phi-phi columns."
+                "Could not find CSV axes. Need frequency/theta/phi columns (header-based or first 3 columns)."
             )
 
         def _parse_float(raw: str) -> float:
@@ -1528,7 +1631,7 @@ class RcsGrid:
             return float(text)
 
         records: list[tuple[float, float, float, float, float, float, float, float, float, float, float]] = []
-        for row in rows[header_idx + 1:]:
+        for row in rows[data_start_idx:]:
             if not row or all(str(cell).strip() == "" for cell in row):
                 continue
             try:
