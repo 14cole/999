@@ -749,6 +749,103 @@ class RcsGrid:
             rcs_domain="power_phase",
         )
 
+    def combine_elevation_pair_to_azimuth_360(
+        self,
+        elevation_lo: float | None = None,
+        elevation_hi: float | None = None,
+        *,
+        azimuth_shift_deg: float = 180.0,
+        tol: float = 1e-6,
+    ):
+        """Stitch two elevation cuts into one 0-360 azimuth cut.
+
+        The lower-elevation cut keeps its original azimuth values. The higher
+        cut is shifted by `azimuth_shift_deg` and merged onto the same output
+        elevation plane. Overlap bins keep the lower-elevation data.
+        """
+
+        el_axis = np.asarray(self.elevations, dtype=float)
+        if el_axis.size < 2:
+            raise ValueError("need at least 2 elevation values to combine into 360 azimuth")
+
+        if elevation_lo is None or elevation_hi is None:
+            finite = el_axis[np.isfinite(el_axis)]
+            if finite.size < 2:
+                raise ValueError("elevation axis has fewer than 2 finite values")
+            lo_value = float(np.min(finite))
+            hi_value = float(np.max(finite))
+        else:
+            lo_value = float(elevation_lo)
+            hi_value = float(elevation_hi)
+
+        if not np.isfinite(lo_value) or not np.isfinite(hi_value):
+            raise ValueError("elevation pair values must be finite")
+        if np.isclose(lo_value, hi_value, atol=tol, rtol=0.0):
+            raise ValueError("elevation pair values must be distinct")
+
+        lo_matches = self._axis_value_match(self.elevations, lo_value, tol=tol)
+        hi_matches = self._axis_value_match(self.elevations, hi_value, tol=tol)
+        if lo_matches.size == 0 or hi_matches.size == 0:
+            raise ValueError("requested elevation pair not found in dataset")
+
+        lo_idx = int(lo_matches[0])
+        hi_idx = int(hi_matches[0])
+        az_shift = float(azimuth_shift_deg)
+        if not np.isfinite(az_shift):
+            raise ValueError("azimuth shift must be finite")
+
+        az_base = np.asarray(self.azimuths, dtype=float)
+        if az_base.size == 0:
+            raise ValueError("dataset has no azimuth samples")
+
+        az_lo = np.array(az_base, copy=True)
+        az_hi = np.array(az_base, copy=True) + az_shift
+        az_merged = self._axis_union([az_lo, az_hi], tol=tol)
+        if az_merged.size == 0:
+            raise ValueError("combined azimuth axis is empty")
+
+        out_shape = (len(az_merged), 1, len(self.frequencies), len(self.polarizations))
+        out_power = np.full(out_shape, np.nan, dtype=np.float32)
+        out_phase = np.full(out_shape, np.nan, dtype=np.float32)
+
+        lo_target_idx = self._indices_for_axis_values(az_merged, az_lo, tol=tol)
+        hi_target_idx = self._indices_for_axis_values(az_merged, az_hi, tol=tol)
+        if lo_target_idx is None or hi_target_idx is None:
+            raise ValueError("failed to align azimuth bins during elevation combine")
+
+        lo_power = self.rcs_power[:, lo_idx, :, :]
+        lo_phase = self.rcs_phase[:, lo_idx, :, :]
+        hi_power = self.rcs_power[:, hi_idx, :, :]
+        hi_phase = self.rcs_phase[:, hi_idx, :, :]
+
+        for src_idx, dst_idx in enumerate(lo_target_idx):
+            out_power[dst_idx, 0, :, :] = lo_power[src_idx, :, :]
+            out_phase[dst_idx, 0, :, :] = lo_phase[src_idx, :, :]
+
+        for src_idx, dst_idx in enumerate(hi_target_idx):
+            existing_power = out_power[dst_idx, 0, :, :]
+            existing_phase = out_phase[dst_idx, 0, :, :]
+            incoming_power = hi_power[src_idx, :, :]
+            incoming_phase = hi_phase[src_idx, :, :]
+
+            take_power = (~np.isfinite(existing_power)) & np.isfinite(incoming_power)
+            existing_power[take_power] = incoming_power[take_power]
+
+            take_phase = np.isfinite(incoming_phase) & (
+                (~np.isfinite(existing_phase)) | take_power
+            )
+            existing_phase[take_phase] = incoming_phase[take_phase]
+
+        return self._new_grid(
+            az_merged,
+            np.asarray([el_axis[lo_idx]], dtype=float),
+            np.array(self.frequencies, copy=True),
+            np.array(self.polarizations, copy=True),
+            rcs_power=out_power,
+            rcs_phase=out_phase,
+            rcs_domain="power_phase",
+        )
+
     def medianize_azimuth(self, window_deg: float, slide_deg: float):
         """Sliding-window median over azimuth (in degrees).
 
@@ -1590,6 +1687,42 @@ class RcsGrid:
         def _norm_token(text: str) -> str:
             return re.sub(r"[^a-z0-9]+", "", str(text).strip().lower())
 
+        def _frequency_from_filename_ghz(file_path: str) -> float | None:
+            name = os.path.basename(str(file_path))
+            match = re.search(
+                r"(?:^|[^a-z0-9])f\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([a-z]+)?",
+                name,
+                flags=re.IGNORECASE,
+            )
+            if match is None:
+                return None
+            try:
+                raw_value = float(match.group(1))
+            except (TypeError, ValueError):
+                return None
+            if not np.isfinite(raw_value):
+                return None
+
+            raw_unit = (match.group(2) or "").strip().lower()
+            unit = raw_unit
+            if unit.startswith("ghz"):
+                scale = 1.0
+            elif unit.startswith("mhz"):
+                scale = 1.0e-3
+            elif unit.startswith("khz"):
+                scale = 1.0e-6
+            elif unit.startswith("hz"):
+                scale = 1.0e-9
+            else:
+                magnitude = abs(raw_value)
+                if magnitude >= 1.0e6:
+                    scale = 1.0e-9
+                elif magnitude >= 1.0e3:
+                    scale = 1.0e-3
+                else:
+                    scale = 1.0
+            return float(raw_value * scale)
+
         alias_to_key = {
             "thetadeg": "theta_deg",
             "phideg": "phi_deg",
@@ -1714,7 +1847,13 @@ class RcsGrid:
 
         azims = np.asarray(sorted({r[0] for r in records}), dtype=float)   # theta -> azimuth
         elevs = np.asarray(sorted({r[1] for r in records}), dtype=float)   # phi -> elevation
-        freqs = np.asarray([0.0], dtype=float)
+        freq_ghz = _frequency_from_filename_ghz(path)
+        if freq_ghz is None:
+            freqs = np.asarray([0.0], dtype=float)
+            freq_unit = "arb"
+        else:
+            freqs = np.asarray([float(freq_ghz)], dtype=float)
+            freq_unit = "GHz"
         pols = np.asarray(["VV", "HH", "TOTAL"], dtype=object)
 
         el_idx = {float(v): i for i, v in enumerate(elevs.tolist())}
@@ -1756,5 +1895,5 @@ class RcsGrid:
             rcs_domain="power_phase",
             source_path=path,
             history=f"Loaded theta/phi TXT: {path}",
-            units={"azimuth": "deg", "elevation": "deg", "frequency": "arb"},
+            units={"azimuth": "deg", "elevation": "deg", "frequency": freq_unit},
         )
